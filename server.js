@@ -128,19 +128,9 @@ wss.on("connection", (twilioWs, req) => {
     elevenWs.on("open", () => {
       log("[elevenlabs] WebSocket connected");
 
-      // Send conversation initiation with audio format config
+      // Send minimal initiation — agent config comes from ElevenLabs dashboard
       const initMsg = {
         type: "conversation_initiation_client_data",
-        conversation_config_override: {
-          agent: {
-            prompt: {
-              prompt: "Ты — Гоша, Growth Agent. Говоришь кратко, по-русски, прямым стилем. Помогаешь с бизнесом, ростом и стратегией. Без воды, только суть.",
-            },
-            first_message: "Привет, Арташес. Гоша на связи. Что будем растить сегодня?",
-            language: "ru",
-          },
-        },
-        custom_llm_extra_body: {},
       };
       elevenWs.send(JSON.stringify(initMsg));
       log("[elevenlabs] sent conversation_initiation_client_data");
