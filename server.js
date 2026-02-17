@@ -3,7 +3,7 @@ const http = require("http");
 const { WebSocketServer, WebSocket } = require("ws");
 const twilio = require("twilio");
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 const TWILIO_SID = process.env.TWILIO_SID;
 const TWILIO_TOKEN = process.env.TWILIO_TOKEN;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
