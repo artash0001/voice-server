@@ -22,6 +22,22 @@ function log(msg) {
   if (logBuffer.length > MAX_LOGS) logBuffer.shift();
 }
 
+// Get signed URL for ElevenLabs conversation
+async function getSignedUrl() {
+  const response = await fetch(
+    `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${ELEVENLABS_AGENT_ID}`,
+    {
+      method: "GET",
+      headers: { "xi-api-key": ELEVENLABS_API_KEY },
+    }
+  );
+  if (!response.ok) {
+    throw new Error(`Failed to get signed URL: ${response.status} ${response.statusText}`);
+  }
+  const data = await response.json();
+  return data.signed_url;
+}
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -36,7 +52,7 @@ app.get("/", (_req, res) => {
       TWILIO_TOKEN: TWILIO_TOKEN ? "set" : "MISSING",
       TWILIO_NUMBER: TWILIO_NUMBER || "MISSING",
       ELEVENLABS_API_KEY: ELEVENLABS_API_KEY ? "set" : "MISSING",
-      ELEVENLABS_AGENT_ID: ELEVENLABS_AGENT_ID || "not set (using inline config)",
+      ELEVENLABS_AGENT_ID: ELEVENLABS_AGENT_ID || "MISSING",
       CALL_TO,
     },
   });
@@ -103,121 +119,116 @@ wss.on("connection", (twilioWs, req) => {
   let streamSid = null;
   let callSid = null;
   let elevenWs = null;
-  let conversationId = null;
 
-  function connectElevenLabs() {
-    if (!ELEVENLABS_API_KEY) {
-      log("[elevenlabs] ERROR: ELEVENLABS_API_KEY not set — cannot connect");
+  async function setupElevenLabs() {
+    if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
+      log("[elevenlabs] ERROR: ELEVENLABS_API_KEY or ELEVENLABS_AGENT_ID missing");
       return;
     }
 
-    if (!ELEVENLABS_AGENT_ID) {
-      log("[elevenlabs] ERROR: ELEVENLABS_AGENT_ID not set — required for Conversational API");
-      return;
-    }
+    try {
+      const signedUrl = await getSignedUrl();
+      log(`[elevenlabs] got signed URL, connecting...`);
 
-    const wsUrl = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${ELEVENLABS_AGENT_ID}`;
-    log(`[elevenlabs] connecting to ${wsUrl}`);
+      elevenWs = new WebSocket(signedUrl);
 
-    elevenWs = new WebSocket(wsUrl, {
-      headers: {
-        "xi-api-key": ELEVENLABS_API_KEY,
-      },
-    });
+      elevenWs.on("open", () => {
+        log("[elevenlabs] WebSocket connected");
 
-    elevenWs.on("open", () => {
-      log("[elevenlabs] WebSocket connected");
-
-      // Send initiation with audio format matching Twilio's mulaw 8kHz
-      const initMsg = {
-        type: "conversation_initiation_client_data",
-        conversation_config_override: {
-          tts: {
-            output_format: "ulaw_8000",
+        // Send conversation initiation
+        const initMsg = {
+          type: "conversation_initiation_client_data",
+          conversation_config_override: {
+            agent: {
+              prompt: {
+                prompt: "Ты — Гоша, Growth Agent. Говоришь кратко, по-русски, прямым стилем. Помогаешь с бизнесом, ростом и стратегией.",
+              },
+              first_message: "Привет, Арташес. Гоша на связи. Что будем растить сегодня?",
+            },
           },
-        },
-      };
-      elevenWs.send(JSON.stringify(initMsg));
-      log("[elevenlabs] sent conversation_initiation_client_data (ulaw_8000)");
-    });
+        };
+        elevenWs.send(JSON.stringify(initMsg));
+        log("[elevenlabs] sent conversation_initiation_client_data");
+      });
 
-    elevenWs.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-        log(`[elevenlabs] received: type=${msg.type}`);
+      elevenWs.on("message", (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
 
-        switch (msg.type) {
-          case "conversation_initiation_metadata":
-            conversationId = msg.conversation_id;
-            log(`[elevenlabs] conversation started: ${conversationId}`);
-            break;
+          switch (msg.type) {
+            case "conversation_initiation_metadata":
+              log(`[elevenlabs] conversation started: ${msg.conversation_id || "ok"}`);
+              break;
 
-          case "audio": {
-            // ElevenLabs sends base64 mulaw audio — forward to Twilio
-            if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-              const payload =
-                msg.audio?.chunk ||
-                msg.audio_event?.audio_base_64 ||
-                msg.audio;
-              if (typeof payload === "string" && payload.length > 0) {
-                twilioWs.send(
-                  JSON.stringify({
-                    event: "media",
-                    streamSid,
-                    media: { payload },
-                  })
+            case "audio": {
+              if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+                const payload = msg.audio?.chunk || msg.audio_event?.audio_base_64;
+                if (payload) {
+                  twilioWs.send(
+                    JSON.stringify({
+                      event: "media",
+                      streamSid,
+                      media: { payload },
+                    })
+                  );
+                }
+              } else {
+                log("[elevenlabs] got audio but no streamSid yet");
+              }
+              break;
+            }
+
+            case "agent_response":
+              log(`[elevenlabs] agent: ${msg.agent_response_event?.agent_response || ""}`);
+              break;
+
+            case "user_transcript":
+              log(`[elevenlabs] user: ${msg.user_transcription_event?.user_transcript || ""}`);
+              break;
+
+            case "interruption":
+              log("[elevenlabs] interruption");
+              if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
+                twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
+              }
+              break;
+
+            case "ping":
+              if (msg.ping_event?.event_id) {
+                elevenWs.send(
+                  JSON.stringify({ type: "pong", event_id: msg.ping_event.event_id })
                 );
               }
-            }
-            break;
+              break;
+
+            case "error":
+              log(`[elevenlabs] ERROR: ${JSON.stringify(msg)}`);
+              break;
+
+            default:
+              log(`[elevenlabs] ${msg.type}: ${JSON.stringify(msg).slice(0, 300)}`);
+              break;
           }
-
-          case "agent_response":
-            log(`[elevenlabs] agent says: ${msg.agent_response_event?.agent_response || JSON.stringify(msg)}`);
-            break;
-
-          case "user_transcript":
-            log(`[elevenlabs] user said: ${msg.user_transcription_event?.user_transcript || JSON.stringify(msg)}`);
-            break;
-
-          case "interruption":
-            log("[elevenlabs] user interrupted");
-            if (streamSid && twilioWs.readyState === WebSocket.OPEN) {
-              twilioWs.send(JSON.stringify({ event: "clear", streamSid }));
-            }
-            break;
-
-          case "ping": {
-            const pong = { type: "pong" };
-            if (msg.ping_event?.event_id) {
-              pong.event_id = msg.ping_event.event_id;
-            }
-            elevenWs.send(JSON.stringify(pong));
-            break;
-          }
-
-          case "error":
-            log(`[elevenlabs] ERROR: ${JSON.stringify(msg)}`);
-            break;
-
-          default:
-            log(`[elevenlabs] unhandled type=${msg.type}: ${JSON.stringify(msg).slice(0, 200)}`);
-            break;
+        } catch (err) {
+          log(`[elevenlabs] parse error: ${err.message}`);
         }
-      } catch (err) {
-        log(`[elevenlabs] parse error: ${err.message}`);
-      }
-    });
+      });
 
-    elevenWs.on("close", (code, reason) => {
-      log(`[elevenlabs] closed: code=${code} reason=${reason}`);
-      elevenWs = null;
-    });
+      elevenWs.on("close", (code, reason) => {
+        log(`[elevenlabs] closed: code=${code} reason=${reason}`);
+        elevenWs = null;
+      });
 
-    elevenWs.on("error", (err) => {
-      log(`[elevenlabs] ws error: ${err.message}`);
-    });
+      elevenWs.on("error", (err) => {
+        log(`[elevenlabs] ws error: ${err.message}`);
+      });
+    } catch (err) {
+      log(`[elevenlabs] setup error: ${err.message}`);
+    }
   }
+
+  // Start ElevenLabs connection immediately
+  setupElevenLabs();
 
   twilioWs.on("message", (data) => {
     try {
@@ -232,16 +243,15 @@ wss.on("connection", (twilioWs, req) => {
           streamSid = msg.start.streamSid;
           callSid = msg.start.callSid;
           log(`[twilio] stream started: streamSid=${streamSid} callSid=${callSid}`);
-          connectElevenLabs();
           break;
 
         case "media": {
+          // Forward Twilio audio to ElevenLabs
           if (elevenWs && elevenWs.readyState === WebSocket.OPEN) {
-            elevenWs.send(
-              JSON.stringify({
-                user_audio_chunk: msg.media.payload,
-              })
-            );
+            const audioMessage = {
+              user_audio_chunk: Buffer.from(msg.media.payload, "base64").toString("base64"),
+            };
+            elevenWs.send(JSON.stringify(audioMessage));
           }
           break;
         }
