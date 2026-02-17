@@ -128,12 +128,17 @@ wss.on("connection", (twilioWs, req) => {
     elevenWs.on("open", () => {
       log("[elevenlabs] WebSocket connected");
 
-      // Send minimal initiation — agent config comes from ElevenLabs dashboard
+      // Send initiation with audio format matching Twilio's mulaw 8kHz
       const initMsg = {
         type: "conversation_initiation_client_data",
+        conversation_config_override: {
+          tts: {
+            output_format: "ulaw_8000",
+          },
+        },
       };
       elevenWs.send(JSON.stringify(initMsg));
-      log("[elevenlabs] sent conversation_initiation_client_data");
+      log("[elevenlabs] sent conversation_initiation_client_data (ulaw_8000)");
     });
 
     elevenWs.on("message", (data) => {
