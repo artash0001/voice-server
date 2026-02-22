@@ -2,14 +2,17 @@ const express = require("express");
 const http = require("http");
 const { WebSocketServer, WebSocket } = require("ws");
 const twilio = require("twilio");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 10000;
 const TWILIO_SID = process.env.TWILIO_SID;
 const TWILIO_TOKEN = process.env.TWILIO_TOKEN;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
-const CALL_TO = process.env.CALL_TO || "+971507510161";
-const TWILIO_NUMBER = process.env.TWILIO_NUMBER || "+15855492907";
+const CALL_TO = process.env.CALL_TO;
+const TWILIO_NUMBER = process.env.TWILIO_NUMBER;
+const VOICE_API_KEY = process.env.VOICE_API_KEY;
+const ALLOWED_HOST = process.env.ALLOWED_HOST; // e.g. "voice.example.com"
 
 // In-memory log buffer for /debug endpoint
 const logBuffer = [];
@@ -22,10 +25,70 @@ function log(msg) {
   if (logBuffer.length > MAX_LOGS) logBuffer.shift();
 }
 
+// --- Auth middleware ---
+function requireAuth(req, res, next) {
+  // Twilio webhook requests are validated separately
+  if (req.path === "/voice") return next();
+
+  if (!VOICE_API_KEY) {
+    log("[auth] WARNING: VOICE_API_KEY not set, all requests rejected");
+    return res.status(503).json({ error: "Server not configured" });
+  }
+
+  const provided =
+    req.headers["x-api-key"] ||
+    req.headers["authorization"]?.replace(/^Bearer\s+/i, "");
+
+  if (!provided || !safeEqual(provided, VOICE_API_KEY)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+}
+
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// --- Twilio request validation middleware ---
+function validateTwilioRequest(req, res, next) {
+  if (!TWILIO_TOKEN) return next(); // skip if not configured
+  const twilioSignature = req.headers["x-twilio-signature"];
+  if (!twilioSignature) {
+    log("[auth] missing Twilio signature on /voice");
+    return res.status(403).send("Forbidden");
+  }
+  const proto = req.headers["x-forwarded-proto"] || "https";
+  const host = ALLOWED_HOST || req.headers.host;
+  const url = `${proto}://${host}${req.originalUrl}`;
+  const valid = twilio.validateRequest(TWILIO_TOKEN, twilioSignature, url, req.body || {});
+  if (!valid) {
+    log("[auth] invalid Twilio signature");
+    return res.status(403).send("Forbidden");
+  }
+  next();
+}
+
+// --- Host validation ---
+function getValidatedHost(req) {
+  if (ALLOWED_HOST) return ALLOWED_HOST;
+  // Only trust host header, never x-forwarded-host from untrusted sources
+  const host = req.headers.host || "";
+  // Strip port, validate no special chars that could break TwiML/URLs
+  if (!/^[a-zA-Z0-9._:-]+$/.test(host)) {
+    log(`[security] rejected invalid host header: ${host.slice(0, 100)}`);
+    return null;
+  }
+  return host;
+}
+
 // Get signed URL for ElevenLabs conversation
 async function getSignedUrl() {
   const response = await fetch(
-    `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${ELEVENLABS_AGENT_ID}`,
+    `https://api.elevenlabs.io/v1/convai/conversation/get_signed_url?agent_id=${encodeURIComponent(ELEVENLABS_AGENT_ID)}`,
     {
       method: "GET",
       headers: { "xi-api-key": ELEVENLABS_API_KEY },
@@ -42,30 +105,34 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Health check
-app.get("/", (_req, res) => {
+// Health check (auth required — no env details exposed)
+app.get("/", requireAuth, (_req, res) => {
   res.json({
     status: "ok",
     service: "voice-server",
     env: {
       TWILIO_SID: TWILIO_SID ? "set" : "MISSING",
       TWILIO_TOKEN: TWILIO_TOKEN ? "set" : "MISSING",
-      TWILIO_NUMBER: TWILIO_NUMBER || "MISSING",
+      TWILIO_NUMBER: TWILIO_NUMBER ? "set" : "MISSING",
       ELEVENLABS_API_KEY: ELEVENLABS_API_KEY ? "set" : "MISSING",
-      ELEVENLABS_AGENT_ID: ELEVENLABS_AGENT_ID || "MISSING",
-      CALL_TO,
+      ELEVENLABS_AGENT_ID: ELEVENLABS_AGENT_ID ? "set" : "MISSING",
+      CALL_TO: CALL_TO ? "set" : "MISSING",
     },
   });
 });
 
-// Debug logs
-app.get("/debug", (_req, res) => {
+// Debug logs (auth required)
+app.get("/debug", requireAuth, (_req, res) => {
   res.type("text/plain").send(logBuffer.join("\n") || "(no logs yet)");
 });
 
 // Twilio webhook — returns TwiML to connect call to WebSocket stream
-app.post("/voice", (req, res) => {
-  const host = req.headers["x-forwarded-host"] || req.headers.host;
+// Validated via Twilio request signature instead of API key
+app.post("/voice", validateTwilioRequest, (req, res) => {
+  const host = getValidatedHost(req);
+  if (!host) {
+    return res.status(400).send("Bad Request");
+  }
   const wsUrl = `wss://${host}/twilio-stream`;
 
   log(`[voice] incoming call, streaming to ${wsUrl}`);
@@ -80,16 +147,25 @@ app.post("/voice", (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// Initiate outbound call
-app.post("/call", async (req, res) => {
+// Initiate outbound call (auth required)
+app.post("/call", requireAuth, async (req, res) => {
   if (!TWILIO_SID || !TWILIO_TOKEN) {
     return res.status(500).json({ error: "Twilio credentials not configured" });
   }
+  if (!TWILIO_NUMBER) {
+    return res.status(500).json({ error: "TWILIO_NUMBER not configured" });
+  }
 
   const to = req.body?.to || CALL_TO;
-  const host = req.headers["x-forwarded-host"] || req.headers.host;
-  const proto = req.headers["x-forwarded-proto"] || "https";
-  const voiceUrl = `${proto}://${host}/voice`;
+  if (!to || !/^\+[1-9]\d{6,14}$/.test(to)) {
+    return res.status(400).json({ error: "Invalid phone number. Must be E.164 format (e.g. +14155551234)" });
+  }
+
+  const host = getValidatedHost(req);
+  if (!host) {
+    return res.status(400).json({ error: "Invalid host" });
+  }
+  const voiceUrl = `https://${host}/voice`;
 
   log(`[call] initiating call to ${to}, voiceUrl=${voiceUrl}`);
 
@@ -101,10 +177,10 @@ app.post("/call", async (req, res) => {
       url: voiceUrl,
     });
     log(`[call] created: ${call.sid}`);
-    res.json({ ok: true, callSid: call.sid, to });
+    res.json({ ok: true, callSid: call.sid });
   } catch (err) {
     log(`[call] error: ${err.message}`);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Failed to create call" });
   }
 });
 
@@ -282,8 +358,10 @@ wss.on("connection", (twilioWs, req) => {
 
 server.listen(PORT, () => {
   log(`[server] voice-server listening on port ${PORT}`);
+  log(`[server] VOICE_API_KEY: ${VOICE_API_KEY ? "set" : "MISSING — all requests will be rejected"}`);
   log(`[server] ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY ? "set" : "MISSING"}`);
-  log(`[server] ELEVENLABS_AGENT_ID: ${ELEVENLABS_AGENT_ID || "MISSING"}`);
+  log(`[server] ELEVENLABS_AGENT_ID: ${ELEVENLABS_AGENT_ID ? "set" : "MISSING"}`);
   log(`[server] TWILIO_SID: ${TWILIO_SID ? "set" : "MISSING"}`);
+  log(`[server] ALLOWED_HOST: ${ALLOWED_HOST || "(not set — using Host header)"}`);
   log(`[server] endpoints: GET / | POST /voice | POST /call | GET /debug | WSS /twilio-stream`);
 });
